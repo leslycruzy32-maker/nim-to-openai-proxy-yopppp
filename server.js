@@ -1,6 +1,7 @@
 // server.js — Robust Hybrid OpenAI ↔ NIM Proxy
 // Express 5 Compatible
 // Fixes: auth bypass, startup DDoS, silent stream failures, memory leaks, Express 5 deprecations
+// PATCH: Universal thinking model support (DeepSeek, Qwen, Nemotron, Kimi, GLM, MiniMax)
 
 const express = require('express');
 const cors = require('cors');
@@ -80,6 +81,40 @@ const FALLBACK_MODELS = [
   'nvidia/llama-3.3-nemotron-super-49b-v1.5',
   'google/gemma-4-31b-it'
 ];
+
+// PATCH: ─── Thinking Model Configuration ───────────────────────────────────
+
+// Models known to support/need explicit thinking parameters
+// mode: 'auto' = always thinks, no API flag needed (DeepSeek, Kimi, GLM, MiniMax)
+// mode: 'hybrid' = needs explicit flag (Qwen: enable_thinking)
+// mode: 'prompt' = controlled via system prompt, not API flag (Nemotron)
+const THINKING_MODEL_CONFIG = {
+  // DeepSeek V4 family: Always thinks, returns reasoning_content + content
+  'deepseek-ai/deepseek-v4-pro': { mode: 'auto', param: null },
+  'deepseek-ai/deepseek-v4-flash': { mode: 'auto', param: null },
+  
+  // Qwen 3.5: Hybrid thinking — needs enable_thinking flag
+  'qwen/qwen3.5-397b-a17b': { mode: 'hybrid', param: 'enable_thinking' },
+  
+  // Nemotron 3: Uses system prompt control ("detailed thinking on"/"off")
+  'nvidia/nemotron-3-super-120b-a12b': { mode: 'prompt', param: null },
+  'nvidia/nemotron-3-ultra-550b-a55b': { mode: 'prompt', param: null },
+  
+  // Kimi K2: Always thinks
+  'moonshotai/kimi-k2.6': { mode: 'auto', param: null },
+  
+  // GLM: Emits inline <thinking> tags
+  'z-ai/glm-5.1': { mode: 'auto', param: null },
+  
+  // MiniMax: Always thinks
+  'minimaxai/minimax-m2.7': { mode: 'auto', param: null },
+  'minimaxai/minimax-m3': { mode: 'auto', param: null },
+  
+  // Step: Always thinks
+  'stepfun-ai/step-3.5-flash': { mode: 'auto', param: null },
+  'stepfun-ai/step-3.7-flash': { mode: 'auto', param: null },
+};
+
 
 // ─── Middleware ─────────────────────────────────────────────────────────────
 
@@ -223,6 +258,98 @@ function safeWrite(res, data) {
   return false;
 }
 
+// PATCH: ─── Helper: Extract content from thinking model responses ───────────
+
+function extractThinkingContent(message) {
+  if (!message) return { content: '', reasoning: null, isPromoted: false };
+  
+  let content = message.content || '';
+  let reasoning = message.reasoning_content || null;
+  let isPromoted = false;
+  
+  // BUG FIX: Some models (Qwen 3.5 on NIM) put the actual answer in reasoning_content
+  // when content is null/empty. Promote it to content so we don't lose the answer.
+  if (!content && reasoning) {
+    content = reasoning;
+    reasoning = null;
+    isPromoted = true;
+  }
+  
+  // Handle inline <thinking> tags (GLM-style and some DeepSeek formats)
+  if (content && content.includes('<thinking>')) {
+    const thinkMatch = content.match(/<thinking>([\s\S]*?)<\/thinking>/);
+    if (thinkMatch) {
+      reasoning = thinkMatch[1].trim();
+      content = content.replace(/<thinking>[\s\S]*?<\/thinking>/, '').trim();
+    }
+  }
+  
+  return { content, reasoning, isPromoted };
+}
+
+// PATCH: ─── Helper: Format content with reasoning for display ─────────────
+
+function formatWithReasoning(content, reasoning, showReasoning) {
+  if (!showReasoning || !reasoning) return content;
+  
+  // Don't double-wrap if already wrapped
+  if (content.includes('<thinking>')) return content;
+  
+  const safeReasoning = reasoning.replace(/\n/g, '\\n');
+  return `<thinking>\n${safeReasoning}\n</thinking>\n\n${content}`;
+}
+
+// PATCH: ─── Helper: Build thinking-aware request ───────────────────────────
+
+function buildThinkingRequest(baseRequest, modelId, enableThinking) {
+  const config = THINKING_MODEL_CONFIG[modelId];
+  
+  // If model not in config or thinking not explicitly toggled, return as-is
+  if (!config) return baseRequest;
+  
+  const extraBody = baseRequest.extra_body ? { ...baseRequest.extra_body } : {};
+  
+  switch (config.mode) {
+    case 'hybrid':
+      // Qwen-style: inject enable_thinking into extra_body
+      // If ENABLE_THINKING_MODE is true, enable. If false, explicitly disable.
+      // If undefined, don't set (model default).
+      if (enableThinking !== undefined) {
+        extraBody[config.param] = enableThinking;
+        console.log(`[THINKING] ${modelId}: set ${config.param}=${enableThinking}`);
+      }
+      break;
+      
+    case 'prompt':
+      // Nemotron-style: thinking controlled by system prompt
+      // Log a reminder if user expects thinking but didn't set system prompt
+      if (enableThinking) {
+        const hasThinkingPrompt = baseRequest.messages?.some(
+          m => m.role === 'system' && 
+               (m.content?.toLowerCase().includes('detailed thinking') || 
+                m.content?.toLowerCase().includes('thinking on'))
+        );
+        if (!hasThinkingPrompt) {
+          console.warn(`[THINKING] ${modelId}: This model requires a system prompt with "detailed thinking on" to enable reasoning.`);
+        }
+      }
+      break;
+      
+    case 'auto':
+      // DeepSeek/Kimi/GLM/MiniMax: always thinks or no API control
+      // No extra parameter needed, but log for visibility
+      if (enableThinking) {
+        console.log(`[THINKING] ${modelId}: Model thinks automatically, no API flag needed.`);
+      }
+      break;
+  }
+  
+  return {
+    ...baseRequest,
+    extra_body: Object.keys(extraBody).length > 0 ? extraBody : undefined
+  };
+}
+
 // ─── Helper: Fallback Chain ─────────────────────────────────────────────────
 
 async function callWithFallback(baseRequest, models) {
@@ -230,9 +357,12 @@ async function callWithFallback(baseRequest, models) {
 
   for (const model of models) {
     try {
+      // PATCH: Apply thinking model configuration before each attempt
+      const thinkingRequest = buildThinkingRequest(baseRequest, model, ENABLE_THINKING_MODE);
+      
       const res = await axios.post(
         `${NIM_API_BASE}/chat/completions`,
-        { ...baseRequest, model },
+        thinkingRequest,
         {
           headers: {
             Authorization: `Bearer ${NIM_API_KEY}`,
@@ -261,7 +391,7 @@ async function callWithFallback(baseRequest, models) {
 // ─── Routes ────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '2.1.0' });
+  res.json({ status: 'ok', version: '2.2.0' }); // PATCH: bumped version
 });
 
 app.get('/v1/models', (req, res) => {
@@ -294,7 +424,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     const baseRequest = {
       messages,
-      model: primaryModel, // Note: callWithFallback will override this
+      model: primaryModel,
       temperature: temperature ?? 0.7,
       max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
       top_p: req.body.top_p,
@@ -305,11 +435,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       tools: req.body.tools,
       tool_choice: req.body.tool_choice,
       response_format: req.body.response_format,
-      extra_body: ENABLE_THINKING_MODE
-        ? { chat_template_kwargs: { thinking: true } }
-        : undefined
-};
-    
+      // PATCH: Removed hardcoded chat_template_kwargs. Now handled by buildThinkingRequest().
+      extra_body: undefined
+    };
 
     const { response, model: usedModel } = await callWithFallback(baseRequest, modelChain);
     upstreamStream = response.data;
@@ -351,11 +479,13 @@ app.post('/v1/chat/completions', async (req, res) => {
           const data = JSON.parse(line.slice(6));
           const delta = data.choices?.[0]?.delta;
 
+          // PATCH: Replaced old reasoning logic with extractThinkingContent
           if (delta) {
-            let content = delta.content || '';
-            const reasoning = delta.reasoning_content;
+            const { content: extractedContent, reasoning, isPromoted } = extractThinkingContent(delta);
+            let content = extractedContent;
 
-            if (SHOW_REASONING) {
+            // If reasoning exists and SHOW_REASONING is on, wrap it
+            if (SHOW_REASONING && reasoning && !isPromoted) {
               if (reasoning && !reasoningOpen) {
                 content = `<thinking>\n${reasoning.replace(/\n/g, '\\n')}`;
                 reasoningOpen = true;
@@ -456,100 +586,4 @@ app.post('/v1/chat/completions', async (req, res) => {
         const clientGone = req.destroyed || !res.writable;
         
         if (!streamEndedCleanly && clientGone) {
-          console.warn('[STREAM] Client disconnected prematurely');
-        }
-
-        if (upstreamStream && !upstreamStream.destroyed && !streamEndedCleanly) {
-          upstreamStream.destroy();
-        }
-        cleanup();
-      });
-
-    } else {
-      // Non-streaming response
-      const openaiResponse = {
-        id: `chatcmpl-${Date.now()}`,
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model: model,
-        choices: (response.data.choices || []).map((choice, i) => {
-          let content = choice.message?.content || '';
-
-          if (SHOW_REASONING && choice.message?.reasoning_content) {
-            const safeReasoning = choice.message.reasoning_content.replace(/\n/g, '\\n');
-            content = `<thinking>\n${safeReasoning}\n</thinking>\n\n${content}`;
-          }
-
-          return {
-            index: i,
-            message: {
-              role: choice.message?.role || 'assistant',
-              content,
-              tool_calls: choice.message?.tool_calls
-            },
-            finish_reason: choice.finish_reason || 'stop'
-          };
-        }),
-        usage: response.data.usage || {
-          prompt_tokens: 0,
-          completion_tokens: 0,
-          total_tokens: 0
-        }
-      };
-
-      res.json(openaiResponse);
-    }
-
-  } catch (error) {
-    console.error('[PROXY] Fatal error:', error.message);
-    console.error('[PROXY] NIM response:', error.response?.data);
-
-    if (!res.headersSent) {
-      res.status(error.response?.status || 500).json({
-        error: {
-          message: error.message,
-          type: 'invalid_request_error',
-          code: error.response?.status || 500
-        }
-      });
-    } else if (!res.writableEnded) {
-      safeWrite(res, `data: ${JSON.stringify({
-        error: {
-          message: error.message,
-          type: 'proxy_error'
-        }
-      })}\n\n`);
-      safeWrite(res, 'data: [DONE]\n\n');
-      res.end();
-    }
-
-    // Clean up upstream stream if we have it
-    if (upstreamStream && !upstreamStream.destroyed) {
-      upstreamStream.destroy();
-    }
-  }
-});
-
-// FIX: Express 5 named wildcard — but use proper 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    error: {
-      message: `Endpoint ${req.method} ${req.path} not found`,
-      type: 'invalid_request_error',
-      code: 404
-    }
-  });
-});
-
-// ─── Startup ───────────────────────────────────────────────────────────────
-
-app.listen(PORT, () => {
-  console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
-  console.log(`[PROXY] Max tokens limit: ${MAX_TOKENS_LIMIT}`);
-  
-  // Run validation after server starts, non-blocking
-  validateModels().catch(err => {
-    console.error('[VALIDATION] Startup check failed:', err.message);
-  });
-});
-  
+          console.warn('[STREAM] Clie
